@@ -10,6 +10,7 @@ Verifies the opt-in behaviour contract:
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+from slack_sdk.errors import SlackApiError
 
 from gateway.config import PlatformConfig
 from plugins.platforms.slack import adapter as slack_module
@@ -102,6 +103,76 @@ class TestSendMessageBlocks:
         assert feedback["type"] == "context_actions"
         assert feedback["elements"][0]["type"] == "feedback_buttons"
         assert feedback["elements"][0]["action_id"] == "hermes_feedback"
+
+    @pytest.mark.asyncio
+    async def test_non_threadable_root_retries_once_as_top_level(self):
+        adapter, client = _make_adapter({
+            "rich_blocks": True,
+            "reply_broadcast": True,
+        })
+        cannot_reply = SlackApiError(
+            "cannot reply to message",
+            {"ok": False, "error": "cannot_reply_to_message"},
+        )
+        client.chat_postMessage = AsyncMock(
+            side_effect=[cannot_reply, {"ts": "111.333"}]
+        )
+
+        result = await adapter.send(
+            "C1",
+            RICH_MD,
+            reply_to="111.000",
+            metadata={"team_id": "T_SECONDARY"},
+        )
+
+        assert result.success is True
+        assert result.message_id == "111.333"
+        assert client.chat_postMessage.await_count == 2
+        first = client.chat_postMessage.await_args_list[0].kwargs
+        second = client.chat_postMessage.await_args_list[1].kwargs
+        assert first["thread_ts"] == "111.000"
+        assert first["reply_broadcast"] is True
+        assert first["blocks"]
+        assert "thread_ts" not in second
+        assert "reply_broadcast" not in second
+        assert second["blocks"] == first["blocks"]
+        adapter.stop_typing.assert_awaited_once_with(
+            "C1", metadata={"team_id": "T_SECONDARY"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_other_slack_api_error_does_not_retry(self):
+        adapter, client = _make_adapter()
+        channel_not_found = SlackApiError(
+            "channel not found",
+            {"ok": False, "error": "channel_not_found"},
+        )
+        client.chat_postMessage = AsyncMock(side_effect=channel_not_found)
+
+        result = await adapter.send("C1", "hello", reply_to="111.000")
+
+        assert result.success is False
+        assert "channel_not_found" in result.error
+        assert client.chat_postMessage.await_count == 1
+        adapter.stop_typing.assert_awaited_once_with("C1", metadata=None)
+
+    @pytest.mark.asyncio
+    async def test_block_rejection_still_retries_without_blocks_in_thread(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[SlackRejectedBlocks("invalid_blocks"), {"ts": "111.333"}]
+        )
+
+        result = await adapter.send("C1", RICH_MD, reply_to="111.000")
+
+        assert result.success is True
+        assert client.chat_postMessage.await_count == 2
+        first = client.chat_postMessage.await_args_list[0].kwargs
+        second = client.chat_postMessage.await_args_list[1].kwargs
+        assert first["blocks"]
+        assert second["thread_ts"] == "111.000"
+        assert "blocks" not in second
+        adapter.stop_typing.assert_awaited_once_with("C1", metadata=None)
 
 
 class TestEditMessageBlocks:
@@ -197,5 +268,3 @@ class TestMarkdownBlockMode:
         kwargs = client.chat_update.await_args.kwargs
         assert kwargs["blocks"][0]["type"] == "markdown"
         assert kwargs["blocks"][0]["text"] == RICH_TABLE_MD
-
-

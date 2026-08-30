@@ -3012,6 +3012,7 @@ class SlackAdapter(BasePlatformAdapter):
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
+            status_thread_ts = thread_ts
             last_result = None
 
             # reply_broadcast: also post thread replies to the main channel.
@@ -3045,7 +3046,22 @@ class SlackAdapter(BasePlatformAdapter):
                         chat_id, team_id=team_id
                     ).chat_postMessage(**kwargs)
                 except Exception as e:
-                    if kwargs.get("blocks") and self._is_block_payload_rejection(e):
+                    if thread_ts and self._is_non_threadable_reply_error(e):
+                        retry_kwargs = dict(kwargs)
+                        retry_kwargs.pop("thread_ts", None)
+                        retry_kwargs.pop("reply_broadcast", None)
+                        logger.info(
+                            "[Slack] Thread root rejected replies; retrying send "
+                            "as a top-level message: %s",
+                            e,
+                        )
+                        last_result = await self._get_client(
+                            chat_id, team_id=team_id
+                        ).chat_postMessage(**retry_kwargs)
+                        # Keep any remaining chunks on the same top-level
+                        # surface instead of retrying the rejected root again.
+                        thread_ts = None
+                    elif kwargs.get("blocks") and self._is_block_payload_rejection(e):
                         retry_kwargs = dict(kwargs)
                         retry_kwargs.pop("blocks", None)
                         logger.info(
@@ -3059,7 +3075,7 @@ class SlackAdapter(BasePlatformAdapter):
                         raise
 
             # Clear Slack Assistant status as soon as the final message is posted.
-            if thread_ts:
+            if status_thread_ts:
                 await self.stop_typing(chat_id, metadata=metadata)
 
             # Track the sent message ts so we can auto-respond to thread
@@ -4127,6 +4143,18 @@ class SlackAdapter(BasePlatformAdapter):
         return self._is_retryable_error(body)
 
     # ----- Markdown → mrkdwn conversion -----
+
+    @staticmethod
+    def _is_non_threadable_reply_error(error: BaseException) -> bool:
+        """Return True when Slack rejects a non-threadable reply target."""
+        response = getattr(error, "response", None)
+        response_get = getattr(response, "get", None)
+        if not callable(response_get):
+            return False
+        try:
+            return response_get("error") == "cannot_reply_to_message"
+        except Exception:
+            return False
 
     @staticmethod
     def _is_block_payload_rejection(error: BaseException) -> bool:
