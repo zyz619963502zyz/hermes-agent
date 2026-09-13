@@ -118,7 +118,9 @@ Returned fields (present when the driver supports them):
 - `escalation`: `{recommended: "px" | "foreground", reason}` — present
   only when there's a next rung to try.
 - `code`: a structured refusal like `"background_unavailable"` or
-  `"foreground_unsupported"`.
+  `"foreground_unsupported"`. On Windows, `"window_minimized"` means the
+  target must be restored or brought to the foreground, followed by a fresh
+  capture, before retrying; do not bypass or blindly repeat the action.
 - `verified`: `true` only on AX read-back.
 
 Walk it in order:
